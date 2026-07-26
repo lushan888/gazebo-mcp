@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import time
+import math
 from typing import Any
+import random
 
 
 class MockBackend:
@@ -19,6 +21,7 @@ class MockBackend:
         self._t0 = time.time()
         self._sim_time = 0.0
         self._models = self._seed_models(profile)
+        self._graph = self._seed_graph()
         return {
             "ok": True,
             "profile": profile,
@@ -73,6 +76,120 @@ class MockBackend:
             }
         )
         return models
+
+    def _seed_graph(self) -> dict[str, dict[str, Any]]:
+        """Seed parent-child relationship graph for models."""
+        graph: dict[str, dict[str, Any]] = {}
+        for name, m in self._models.items():
+            graph[name] = {
+                "name": name,
+                "parent": None,
+                "children": [],
+                "type": m.get("type", "unknown"),
+                "joint_type": "fixed",
+            }
+        return graph
+
+    def _synthetic_lidar(self) -> dict[str, Any]:
+        """Generate synthetic lidar scan data."""
+        n_rays = 360
+        angle_min = 0.0
+        angle_max = 2.0 * math.pi
+        angle_increment = (angle_max - angle_min) / n_rays
+        ranges = []
+        for i in range(n_rays):
+            angle = angle_min + i * angle_increment
+            base = 5.0 + random.uniform(-0.5, 0.5)
+            for model_name, m in self._models.items():
+                if model_name == "ground_plane":
+                    continue
+                # Simple ray-to-model distance check
+                dx = m["pose"]["x"]
+                dy = m["pose"]["y"]
+                ray_angle = math.atan2(dy, dx)
+                angle_diff = abs(angle - ray_angle)
+                if angle_diff < 0.1:  # Ray roughly pointing at model
+                    dist = math.sqrt(dx*dx + dy*dy)
+                    if dist < base and dist > 0.3:
+                        base = dist + random.uniform(-0.05, 0.05)
+            ranges.append(round(base, 3))
+        return {
+            "n_rays": n_rays,
+            "angle_min": angle_min,
+            "angle_max": angle_max,
+            "angle_increment": angle_increment,
+            "range_min": 0.1,
+            "range_max": 5.0,
+            "ranges": ranges,
+            "frame_id": "lidar_mock",
+            "timestamp_sec": round(self._sim_time, 3),
+        }
+
+    def _synthetic_camera(self) -> dict[str, Any]:
+        """Generate synthetic camera depth data."""
+        # Generate mock depth frame
+        width, height = 640, 480
+        depth_data = []
+        for y in range(height):
+            row = []
+            for x in range(width):
+                # Simple depth based on position
+                d = 2.0 + 0.5 * math.sin(x * 0.01) + 0.3 * math.cos(y * 0.01)
+                row.append(round(d, 3))
+            depth_data.append(row)
+        return {
+            "width": width,
+            "height": height,
+            "encoding": "32FC1",
+            "depth_data_summary": {
+                "min": min(min(row) for row in depth_data),
+                "max": max(max(row) for row in depth_data),
+            },
+            "frame_id": "camera_mock",
+            "timestamp_sec": round(self._sim_time, 3),
+        }
+
+    def sensor_snapshot(self, sensor_type: str = "lidar") -> dict[str, Any]:
+        """Return synthetic sensor data for agent workflows.
+
+        Args:
+            sensor_type: One of "lidar", "camera", or "all".
+
+        Returns:
+            Dictionary with sensor frame data.
+        """
+        if not self._paused:
+            self._sim_time = time.time() - self._t0
+        st = sensor_type.strip().lower()
+        if st not in ("lidar", "camera", "all"):
+            return {
+                "ok": False,
+                "error": f"unsupported sensor type: {sensor_type}",
+            }
+        result: dict[str, Any] = {
+            "ok": True,
+            "sensor_type": st,
+            "world": self._world,
+            "model_count": len(self._models),
+            "timestamp": round(self._sim_time, 3),
+            "schema": {"type": "object", "properties": {}},
+        }
+        if st in ("lidar", "all"):
+            result["frame"] = self._synthetic_lidar()
+        if st in ("camera", "all"):
+            result["frame"] = self._synthetic_camera()
+        return result
+
+    def model_graph(self) -> dict[str, Any]:
+        """Return the parent-child relationship graph of models."""
+        return {
+            "ok": True,
+            "world": self._world,
+            "mode": "mock",
+            "graph": list(self._graph.values()),
+            "node_count": len(self._graph),
+            "edge_count": sum(len(n["children"]) for n in self._graph.values()),
+        }
 
     def _twist(
         self,
@@ -145,7 +262,7 @@ class MockBackend:
         return list(self._models.values())
 
     def snapshot(self) -> dict[str, Any]:
-        """Full world snapshot: models, sim time, physics params."""
+        """Full world snapshot: models, poses, sim time, physics params."""
         if not self._paused:
             self._sim_time = time.time() - self._t0
         return {
@@ -180,6 +297,13 @@ class MockBackend:
             "pose": {"x": float(x), "y": float(y), "z": float(z), "yaw": float(yaw)},
             "twist": self._twist(),
         }
+        self._graph[name] = {
+            "name": name,
+            "parent": None,
+            "children": [],
+            "type": model_type or "box",
+            "joint_type": "fixed",
+        }
         return {"ok": True, "model": self._models[name]}
 
     def delete(self, name: str) -> dict[str, Any]:
@@ -188,6 +312,19 @@ class MockBackend:
         if name == "ground_plane":
             return {"ok": False, "error": "cannot delete ground_plane"}
         del self._models[name]
+        # Remove from graph and detach from parent
+        node = self._graph.pop(name, None)
+        if node and node.get("parent"):
+            parent_name = node["parent"]
+            if parent_name in self._graph:
+                self._graph[parent_name]["children"] = [
+                    c for c in self._graph[parent_name]["children"] if c != name
+                ]
+        # Orphan children
+        if node:
+            for child_name in node.get("children", []):
+                if child_name in self._graph:
+                    self._graph[child_name]["parent"] = None
         return {"ok": True, "deleted": name}
 
     def get_pose(self, name: str) -> dict[str, Any]:

@@ -139,5 +139,17 @@ def gazebo_step(steps: int = 1) -> str:
     return _j(get_backend().step(steps))
 
 
+@mcp.tool()
+def gazebo_sensor_snapshot(sensor_type: str = "lidar") -> str:
+    """Return synthetic sensor frames (lidar / camera / all) for agent workflows."""
+    return _j(get_backend().sensor_snapshot(sensor_type))
+
+
+@mcp.tool()
+def gazebo_model_graph() -> str:
+    """Return the parent-child relationship graph of all models."""
+    return _j(get_backend().model_graph())
+
+
 def run_stdio() -> None:
     mcp.run(transport="stdio")
